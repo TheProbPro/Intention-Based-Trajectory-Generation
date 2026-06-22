@@ -1,0 +1,436 @@
+"""
+PERIODIC DYNAMIC MOVEMENT PRIMITIVES (pDMP)
+
+This periodic DMP system has 3 modes:
+    - LEARN: learns the DMP shape based on some input signal
+    - UPDATE: updates the DMP shape based on some input signal 
+    - REPEAT: repeats the existing DMP
+
+INSPIRATION:
+L. Peternel, T. Noda, T. Petrič, A. Ude, J. Morimoto and J. Babič
+Adaptive control of exoskeleton robots for periodic assistive behaviours based on EMG feedback minimisation,
+PLOS One 11(2): e0148942, Feb 2016
+
+ADAPTED BY: Victor Brønsholm Nielsen
+
+"""
+
+import numpy as np
+
+class Method11:
+    # INITIALISATION
+    def __init__(self, DOF, N, alpha, beta, lambd, dt):
+    
+        # settings
+        self.DOF = DOF # degrees of freedom (number of DMPs)
+        self.N = N # number of kernel functions per DMP
+        self.alpha = alpha # DMP gain alpha
+        self.beta = beta # DMP gain beta
+        self.lambd = lambd # forgetting factor
+        self.dt = dt # sample time
+        
+        # DMP learning variables
+        self.f = np.zeros([self.DOF]) # shape function
+        self.w = np.zeros([self.DOF,self.N]) # DMP weights
+        self.c = np.zeros([self.N]) # centers of kernel functions
+        self.P = np.ones([self.DOF,self.N]) # regression variable P
+        self.r = np.ones([self.DOF]) # amplitude parameter
+        self.g = np.zeros([self.DOF]) # DMP goal variable
+        
+        # DMP state variables
+        self.y = np.zeros([self.DOF]) 
+        self.z = np.zeros([self.DOF]) 
+
+        # DMP phase and period
+        self.phi = np.zeros([self.DOF]) 
+        self.tau = np.zeros([self.DOF])
+        
+        # define centers of kernel functions
+        spread = ( 2 * np.pi - 0.0 ) / N # distance between the kernels
+        for i in range(self.N):
+            self.c[i] = 0.5 * spread + spread * i
+    
+    # GET STATE
+    def get_state(self):
+        dy = self.z / self.tau
+        
+        if hasattr(self, "use_bounded_output") and self.use_bounded_output:
+            y_out = self._bounded_output(self.y)
+            dy_out = self._bounded_output_derivative(self.y) * dy
+            return y_out, dy_out, self.tau, self.phi
+
+        return self.y, dy, self.tau, self.phi
+    
+    # SET DMP PHASE
+    def set_phase(self, phi):
+        self.phi = phi
+    
+    # SET DMP PERIOD
+    def set_period(self, tau):
+        self.tau = tau
+    
+    # SET DMP WEIGHTS
+    def set_weights(self, DOF, w):
+        self.w[DOF,:] = w
+    
+    # GET DMP WEIGHTS
+    def get_weights(self, DOF):
+        return self.w[DOF,:]
+    
+    # SET DMP KERNELS
+    def set_kernels(self, c):
+        self.c = c
+    
+    # GET DMP KERNELS
+    def get_kernels(self):
+        return self.c
+    
+    # LEARN MODE
+    def learn(self, y, dy, ddy):
+        f_d = np.zeros([self.DOF])
+        psi = np.zeros([self.N])
+        
+        for i in range(self.DOF):
+            psi_sum = 0
+            weighted_sum = 0
+            
+            # desired shape
+            f_d[i] = self.tau[i]**2 * ddy[i] - self.alpha * (self.beta * ( self.g[i] - y[i] ) - self.tau[i] * dy[i])
+            
+            # recursive least-squares regression
+            for j in range(self.N):
+                # update kernels and weights
+                psi[j] = np.exp( 2.5 * self.N * ( np.cos( self.phi[i]- self.c[j] ) - 1 ) )
+                P_new = ( self.P[i,j] - ( self.P[i,j]**2 * self.r[i]**2 ) / ( self.lambd / psi[j] + self.P[i,j] * self.r[i]**2 ) ) / self.lambd
+                self.w[i,j] += psi[j] * P_new * self.r[i] * ( f_d[i] - self.w[i,j] * self.r[i] )
+                self.P[i,j] = P_new
+                
+                # sum kernels and weights
+                weighted_sum += self.w[i,j] * psi[j] * self.r[i]
+                psi_sum += psi[j]
+            
+            # make sure there is no division with zero
+            if ( psi_sum == 0 ):
+                self.f[i] = 0
+            else:
+                self.f[i] = weighted_sum / psi_sum
+        
+    # UPDATE MODE
+    def update(self, U):
+        psi = np.zeros([self.N])
+        
+        for i in range(self.DOF):
+            psi_sum = 0
+            weighted_sum = 0
+            
+            # recursive least-squares regression
+            for j in range(self.N):
+                # update kernels and weights
+                psi[j] = np.exp( 2.5 * self.N * ( np.cos( self.phi[i] - self.c[j] ) - 1 ) )
+                P_new = ( self.P[i,j] - ( self.P[i,j]**2 * self.r[i]**2 ) / ( self.lambd / psi[j] + self.P[i,j] * self.r[i]**2 ) ) / self.lambd
+                self.w[i,j] += psi[j] * P_new * self.r[i] * U[i]
+                self.P[i,j] = P_new
+                
+                # sum kernels and weights
+                weighted_sum += self.w[i,j] * psi[j] * self.r[i]
+                psi_sum += psi[j]
+                
+            # make sure there is no division with zero
+            if ( psi_sum == 0 ):
+                self.f[i] = 0
+            else:
+                self.f[i] = weighted_sum / psi_sum
+    
+    # REPEAT MODE
+    def repeat(self):
+        psi = np.zeros([self.N])
+        
+        for i in range(self.DOF):
+            psi_sum = 0
+            weighted_sum = 0
+            
+            # recursive least-squares regression
+            for j in range(self.N):
+                psi[j] = np.exp( 2.5 * self.N * ( np.cos(self.phi[i] - self.c[j] ) - 1 ) )
+                
+                # sum kernels and weights
+                weighted_sum += self.w[i,j] * psi[j] * self.r[i]
+                psi_sum += psi[j]
+            
+            # make sure there is no division with zero
+            if ( psi_sum == 0 ):
+                self.f[i] = 0
+            else:
+                self.f[i] = weighted_sum / psi_sum
+
+    # INTEGRATION
+    def integration(self):
+        for i in range(self.DOF):
+            dz = ( 1 / self.tau[i] ) * ( self.alpha * ( self.beta * ( self.g[i] - self.y[i] ) - self.z[i] ) + self.f[i] )
+            dy = ( 1 / self.tau[i] ) * self.z[i]
+            
+            self.y[i] += dy * self.dt
+            self.z[i] += dz * self.dt
+
+    def set_output_limits(self, y_min, y_max, squash_gain=1.0):
+        self.y_min = y_min
+        self.y_max = y_max
+        self.squash_gain = squash_gain
+        self.use_bounded_output = True
+
+
+    def _sigmoid(self, q):
+        q = np.asarray(q)
+        out = np.empty_like(q, dtype=float)
+
+        pos = q >= 0
+        out[pos] = 1.0 / (1.0 + np.exp(-q[pos]))
+
+        exp_q = np.exp(q[~pos])
+        out[~pos] = exp_q / (1.0 + exp_q)
+
+        return out
+
+
+    def _bounded_output(self, q):
+        s = self._sigmoid(self.squash_gain * q)
+        return self.y_min + (self.y_max - self.y_min) * s
+
+
+    def _bounded_output_derivative(self, q):
+        s = self._sigmoid(self.squash_gain * q)
+        return (self.y_max - self.y_min) * self.squash_gain * s * (1.0 - s)
+
+
+    def output_to_internal(self, x, eps=1e-6):
+        s = (x - self.y_min) / (self.y_max - self.y_min)
+
+        # only used to avoid log(0), not to clip the DMP output
+        s = np.minimum(np.maximum(s, eps), 1.0 - eps)
+
+        return np.log(s / (1.0 - s)) / self.squash_gain
+
+
+    def set_output_state(self, x):
+        self.y = self.output_to_internal(np.asarray(x))
+        self.z[:] = 0.0
+
+class Method12:
+    # INITIALISATION
+    def __init__(self, DOF, N, alpha, beta, lambd, dt):
+    
+        # settings
+        self.DOF = DOF # degrees of freedom (number of DMPs)
+        self.N = N # number of kernel functions per DMP
+        self.alpha = alpha # DMP gain alpha
+        self.beta = beta # DMP gain beta
+        self.lambd = lambd # forgetting factor
+        self.dt = dt # sample time
+        
+        # DMP learning variables
+        self.f = np.zeros([self.DOF]) # shape function
+        self.w = np.zeros([self.DOF,self.N]) # DMP weights
+        self.c = np.zeros([self.N]) # centers of kernel functions
+        self.P = np.ones([self.DOF,self.N]) # regression variable P
+        self.r = np.ones([self.DOF]) # amplitude parameter
+        self.g = np.zeros([self.DOF]) # DMP goal variable
+        
+        # DMP state variables
+        self.y = np.zeros([self.DOF]) 
+        self.z = np.zeros([self.DOF]) 
+
+        # DMP phase and period
+        self.phi = np.zeros([self.DOF]) 
+        self.tau = np.zeros([self.DOF])
+
+        # coupling term variables
+        self.c_coup = np.zeros(self.DOF)
+        self.dc_coup = np.zeros(self.DOF)
+        
+        # define centers of kernel functions
+        spread = ( 2 * np.pi - 0.0 ) / N # distance between the kernels
+        for i in range(self.N):
+            self.c[i] = 0.5 * spread + spread * i
+    
+    # GET STATE
+    def get_state(self):
+        dy = self.z / self.tau + self.dc_coup
+
+        if hasattr(self, "use_bounded_output") and self.use_bounded_output:
+            y_out = self._bounded_output(self.y)
+            dy_out = self._bounded_output_derivative(self.y) * dy
+            return y_out, dy_out, self.tau, self.phi
+
+        return self.y, dy, self.tau, self.phi
+    
+    # SET DMP PHASE
+    def set_phase(self, phi):
+        self.phi = phi
+    
+    # SET DMP PERIOD
+    def set_period(self, tau):
+        self.tau = tau
+    
+    # SET DMP WEIGHTS
+    def set_weights(self, DOF, w):
+        self.w[DOF,:] = w
+    
+    # GET DMP WEIGHTS
+    def get_weights(self, DOF):
+        return self.w[DOF,:]
+    
+    # SET DMP KERNELS
+    def set_kernels(self, c):
+        self.c = c
+    
+    # GET DMP KERNELS
+    def get_kernels(self):
+        return self.c
+    
+    # LEARN MODE
+    def learn(self, y, dy, ddy):
+        f_d = np.zeros([self.DOF])
+        psi = np.zeros([self.N])
+        
+        for i in range(self.DOF):
+            psi_sum = 0
+            weighted_sum = 0
+            
+            # desired shape
+            f_d[i] = self.tau[i]**2 * ddy[i] - self.alpha * (self.beta * ( self.g[i] - y[i] ) - self.tau[i] * dy[i])
+            
+            # recursive least-squares regression
+            for j in range(self.N):
+                # update kernels and weights
+                psi[j] = np.exp( 2.5 * self.N * ( np.cos( self.phi[i]- self.c[j] ) - 1 ) )
+                P_new = ( self.P[i,j] - ( self.P[i,j]**2 * self.r[i]**2 ) / ( self.lambd / psi[j] + self.P[i,j] * self.r[i]**2 ) ) / self.lambd
+                self.w[i,j] += psi[j] * P_new * self.r[i] * ( f_d[i] - self.w[i,j] * self.r[i] )
+                self.P[i,j] = P_new
+                
+                # sum kernels and weights
+                weighted_sum += self.w[i,j] * psi[j] * self.r[i]
+                psi_sum += psi[j]
+            
+            # make sure there is no division with zero
+            if ( psi_sum == 0 ):
+                self.f[i] = 0
+            else:
+                self.f[i] = weighted_sum / psi_sum
+        
+    # UPDATE MODE
+    def update(self, U):
+        psi = np.zeros([self.N])
+        
+        for i in range(self.DOF):
+            psi_sum = 0
+            weighted_sum = 0
+            
+            # recursive least-squares regression
+            for j in range(self.N):
+                # update kernels and weights
+                psi[j] = np.exp( 2.5 * self.N * ( np.cos( self.phi[i] - self.c[j] ) - 1 ) )
+                P_new = ( self.P[i,j] - ( self.P[i,j]**2 * self.r[i]**2 ) / ( self.lambd / psi[j] + self.P[i,j] * self.r[i]**2 ) ) / self.lambd
+                self.w[i,j] += psi[j] * P_new * self.r[i] * U[i]
+                self.P[i,j] = P_new
+                
+                # sum kernels and weights
+                weighted_sum += self.w[i,j] * psi[j] * self.r[i]
+                psi_sum += psi[j]
+                
+            # make sure there is no division with zero
+            if ( psi_sum == 0 ):
+                self.f[i] = 0
+            else:
+                self.f[i] = weighted_sum / psi_sum
+    
+    # REPEAT MODE
+    def repeat(self):
+        psi = np.zeros([self.N])
+        
+        for i in range(self.DOF):
+            psi_sum = 0
+            weighted_sum = 0
+            
+            # recursive least-squares regression
+            for j in range(self.N):
+                psi[j] = np.exp( 2.5 * self.N * ( np.cos(self.phi[i] - self.c[j] ) - 1 ) )
+                
+                # sum kernels and weights
+                weighted_sum += self.w[i,j] * psi[j] * self.r[i]
+                psi_sum += psi[j]
+            
+            # make sure there is no division with zero
+            if ( psi_sum == 0 ):
+                self.f[i] = 0
+            else:
+                self.f[i] = weighted_sum / psi_sum
+
+    # INTEGRATION
+    def integration(self, coupling_term):
+        for i in range(self.DOF):
+            # coupling_term is c_dot
+            self.dc_coup[i] = coupling_term[i]
+
+            # integrate c_dot -> c
+            self.c_coup[i] += self.dc_coup[i] * self.dt
+
+            dz = (1 / self.tau[i]) * (self.alpha * (self.beta * ((self.g[i] + self.c_coup[i]) - self.y[i]) - self.z[i]) + self.f[i])
+            dy = (1 / self.tau[i]) * self.z[i] + self.dc_coup[i]
+
+            self.y[i] += dy * self.dt
+            self.z[i] += dz * self.dt
+
+    def set_output_limits(self, y_min, y_max, squash_gain=1.0):
+        self.y_min = np.asarray(y_min, dtype=float)
+        self.y_max = np.asarray(y_max, dtype=float)
+        self.squash_gain = squash_gain
+        self.use_bounded_output = True
+
+        if np.any(self.y_max <= self.y_min):
+            raise ValueError("y_max must be greater than y_min.")
+
+        if self.squash_gain <= 0:
+            raise ValueError("squash_gain must be positive.")
+
+
+    def _sigmoid(self, q):
+        q = np.asarray(q)
+        out = np.empty_like(q, dtype=float)
+
+        pos = q >= 0
+        out[pos] = 1.0 / (1.0 + np.exp(-q[pos]))
+
+        exp_q = np.exp(q[~pos])
+        out[~pos] = exp_q / (1.0 + exp_q)
+
+        return out
+
+
+    def _bounded_output(self, q):
+        s = self._sigmoid(self.squash_gain * q)
+        return self.y_min + (self.y_max - self.y_min) * s
+
+
+    def _bounded_output_derivative(self, q):
+        s = self._sigmoid(self.squash_gain * q)
+        return (self.y_max - self.y_min) * self.squash_gain * s * (1.0 - s)
+
+
+    def output_to_internal(self, x, eps=1e-6):
+        x = np.asarray(x, dtype=float)
+
+        s = (x - self.y_min) / (self.y_max - self.y_min)
+
+        # only used to avoid log(0), not to clip the DMP output
+        s = np.minimum(np.maximum(s, eps), 1.0 - eps)
+
+        return np.log(s / (1.0 - s)) / self.squash_gain
+
+
+    def set_output_state(self, x, reset_coupling=False):
+        self.y = self.output_to_internal(x)
+        self.z[:] = 0.0
+
+        if reset_coupling:
+            self.c_coup[:] = 0.0
+            self.dc_coup[:] = 0.0
